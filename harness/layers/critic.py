@@ -70,7 +70,37 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from difflib import SequenceMatcher
+
+from harness.layers._evidence import (
+    MIN_QUOTE_CHARS,
+    norm,
+    quotes_a_line,
+    seen_docs,
+    sources,
+)
 from harness.middleware import Middleware
+
+#: Các trần của bộ chấm (`arena/scorer.py`): claim dài hơn / nhiều hơn mức
+#: này bị chấm `OVERLONG` / `REDUNDANT` / `EXCESS`.
+MAX_CLAIM_CHARS = 500
+MAX_CLAIMS_PER_DOC = 4
+MAX_SCORED_CLAIMS = 10
+
+#: Chỗ mô hình dán hai nửa câu của hai tài liệu vào nhau.
+FUSE_JOINTS = (" và ", "\n", "; ", " nhưng ", " trong khi ", " còn ")
+
+#: Phần còn lại sau khi cắt phải giữ ít nhất chừng này của câu gốc.
+MIN_TRIM_KEEP_RATIO = 0.6
+
+ABSTAIN_ANSWER = (
+    "Không đủ căn cứ để trả lời: các tài liệu đã truy xuất không chứa bằng "
+    "chứng nguyên văn nào xác nhận thông tin được hỏi."
+)
+CONFLICT_ANSWER = (
+    "Không đủ căn cứ để kết luận vì các nguồn đã truy xuất mâu thuẫn nhau. "
+    "Các nguồn nêu:"
+)
 
 
 class Critic(Middleware):
@@ -79,16 +109,110 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        claims = claims if isinstance(claims, list) else []
+        docs = seen_docs(ctx)
+
+        kept: list[dict] = []
+        dropped = 0
+        conflict = False
+        for claim in claims:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            if not isinstance(text, str) or len(norm(text)) > MAX_CLAIM_CHARS:
+                dropped += 1  # hỏng dạng, hoặc dán cả tài liệu vào làm claim
+            elif self._grounded(ctx, text, docs):
+                kept.append(claim)  # giữ nguyên, KHÔNG sửa chữ
+            else:
+                pieces = _split_fused(ctx, text, docs) or _trim_to_quote(text, docs)
+                if not pieces:
+                    dropped += 1  # không bằng chứng nào đỡ: bịa -> bỏ
+                    continue
+                kept.extend(pieces)
+                if len({piece["doc_id"] for piece in pieces}) > 1:
+                    # Một câu khâu từ HAI nguồn: mô hình đã giấu một mâu
+                    # thuẫn. Nêu cả hai phía và từ chối chọn.
+                    conflict = True
+
+        kept = _within_caps(kept)
+        ctx.state["critic_dropped"] = dropped
+        report["claims"] = kept
+        report["citations"] = sorted(
+            {c["doc_id"] for c in kept if isinstance(c.get("doc_id"), str) and c["doc_id"]}
+        )
+        if not kept:
+            report["abstain"] = True
+            report["answer"] = ABSTAIN_ANSWER
+        elif conflict:
+            # `answer` cũ còn mang câu ghép; viết lại nó là miễn phí.
+            report["abstain"] = True
+            report["answer"] = CONFLICT_ANSWER + " " + " / ".join(c["text"] for c in kept)
+        return report
+
+    @staticmethod
+    def _grounded(ctx, text, docs) -> bool:
+        if getattr(ctx, "corpus", None) is None:
+            # Không có corpus để đối chiếu dòng: tín hiệu gốc của docstring.
+            return len(norm(text)) >= MIN_QUOTE_CHARS and ctx.saw(text)
+        return bool(sources(ctx, text, docs))
+
+
+def _split_fused(ctx, text, docs) -> list[dict]:
+    """Trường hợp (c): cắt một câu ghép đúng tại chỗ dán.
+
+    Hai nửa là SUBSTRING của chữ mô hình đã viết (vẫn qua provenance), và
+    mỗi nửa phải là trích dẫn một dòng của một tài liệu đã quan sát.
+    """
+    for joint in FUSE_JOINTS:
+        start = text.find(joint)
+        while start != -1:
+            halves = (text[:start], text[start + len(joint):])
+            found = [sources(ctx, half, docs) for half in halves]
+            if all(found):
+                return [
+                    {"text": half, "doc_id": hits[0].doc_id}
+                    for half, hits in zip(halves, found)
+                ]
+            start = text.find(joint, start + 1)
+    return []
+
+
+def _trim_to_quote(text, docs) -> list[dict]:
+    """Cứu một câu trích mà mô hình lỡ thêm chữ vào hai đầu (dấu chấm cuối
+    câu, dấu nháy bọc ngoài, "Theo tài liệu: ..."): CẮT về đoạn dài nhất
+    nằm nguyên văn trong một dòng đã quan sát. Cắt là hợp lệ; chỉ nhận khi
+    phần giữ lại vẫn là gần hết câu, để một câu diễn đạt lại không bị biến
+    thành một mẩu trích vô nghĩa.
+    """
+    best, best_doc = "", None
+    for doc in docs:
+        for line in doc.body.splitlines():
+            match = SequenceMatcher(None, text, line, autojunk=False).find_longest_match(
+                0, len(text), 0, len(line)
+            )
+            if match.size > len(best):
+                best, best_doc = text[match.a:match.a + match.size], doc
+    best = best.strip()
+    if best_doc is None or len(best) < MIN_TRIM_KEEP_RATIO * len(text.strip()):
+        return []
+    if not quotes_a_line(best, best_doc.body):
+        return []
+    return [{"text": best, "doc_id": best_doc.doc_id}]
+
+
+def _within_caps(claims: list[dict]) -> list[dict]:
+    """Bỏ claim trùng lặp và phần vượt trần của bộ chấm: mỗi claim thừa bị
+    chấm `REDUNDANT`/`EXCESS` chứ không được thêm điểm nào."""
+    kept: list[dict] = []
+    per_doc: dict[str, int] = {}
+    seen: set = set()
+    for claim in claims:
+        key = (norm(claim.get("text")), claim.get("doc_id"))
+        doc_id = claim.get("doc_id") if isinstance(claim.get("doc_id"), str) else ""
+        if key in seen or per_doc.get(doc_id, 0) >= MAX_CLAIMS_PER_DOC:
+            continue
+        if len(kept) >= MAX_SCORED_CLAIMS:
+            break
+        seen.add(key)
+        per_doc[doc_id] = per_doc.get(doc_id, 0) + 1
+        kept.append(claim)
+    return kept

@@ -59,6 +59,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._evidence import quotes_a_line, seen_docs, sources
 from harness.middleware import Middleware
 
 
@@ -68,16 +69,40 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+
+        docs = seen_docs(ctx)
+        seen_ids = {doc.doc_id for doc in docs}
+        fixed = 0
+        for claim in claims:
+            if not isinstance(claim, dict) or not isinstance(claim.get("text"), str):
+                continue  # claim hỏng dạng: việc của `critic`
+            cited = claim.get("doc_id")
+            cited = cited.strip() if isinstance(cited, str) else ""
+            doc = ctx.corpus.get(cited) if cited else None
+            if (
+                doc is not None
+                and cited in seen_ids
+                and quotes_a_line(claim["text"], doc.body)
+            ):
+                continue  # trích dẫn đã đúng
+            found = sources(ctx, claim["text"], docs)
+            if found:
+                # Đổi NGUỒN, không bao giờ đổi CHỮ.
+                claim["doc_id"] = found[0].doc_id
+                fixed += 1
+            # Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
+
+        ctx.state["citations_fixed"] = fixed
+        report["citations"] = sorted(
+            {
+                claim["doc_id"]
+                for claim in claims
+                if isinstance(claim, dict)
+                and isinstance(claim.get("doc_id"), str)
+                and claim["doc_id"]
+            }
+        )
+        return report

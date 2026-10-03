@@ -71,6 +71,9 @@ DEFAULT_MAX_ATTEMPTS = 3
 #: Số lượt để dành cho `submit` mà agent vẫn còn phải gọi.
 DEFAULT_RESERVE = 1
 
+#: Lỗi không phụ thuộc vào xúc xắc của tầng công cụ (xem `arena/tools.py`).
+PERMANENT_ERRORS = ("doc not found:", "invalid expression:", "unknown tool:")
+
 
 class Retry(Middleware):
     """Gọi lại một lượt công cụ trả về kết quả hỏng hoặc suy giảm."""
@@ -87,15 +90,26 @@ class Retry(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§7): khoảng 8-12 dòng.
-        #  1. Trong khi số lần đã thử < self.max_attempts VÀ kết quả còn
-        #     hỏng — tức `(not result.ok) or is_degraded(result.content)` —
-        #     thì gọi lại `call(name, args)` với ĐÚNG name/args cũ.
-        #  2. DỪNG THỬ LẠI khi ngân sách đã cạn: nếu
-        #     `ctx.max_tool_calls` khác None và
-        #     `ctx.tools.calls >= ctx.max_tool_calls - self.reserve`
-        #     thì đừng gọi thêm lượt nào nữa (xem phần cảnh báo ở trên).
-        #  3. Trả về kết quả cuối cùng (kể cả khi vẫn hỏng: agent phải
-        #     nhìn thấy sự thật, đừng bịa nội dung thay nó).
-        #  4. Ghi số lần đã thử vào ctx.state để gỡ lỗi.
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        attempts = 1
+        while attempts < self.max_attempts and self._broken(result):
+            # Tự kiểm ngân sách: `budget_policy` bọc NGOÀI vòng lặp này
+            # nên không nhìn thấy các lượt gọi lại.
+            limit = ctx.max_tool_calls
+            if limit is not None and ctx.tools.calls >= limit - self.reserve:
+                break
+            result = call(name, args)
+            attempts += 1
+        ctx.state["retry_attempts"] = ctx.state.get("retry_attempts", 0) + attempts - 1
+        # Kể cả khi vẫn hỏng: agent phải nhìn thấy sự thật.
+        return result
+
+    @staticmethod
+    def _broken(result) -> bool:
+        """Hỏng theo kiểu ĐÁNG thử lại. `ok=True` không có nghĩa là ổn."""
+        if not getattr(result, "ok", False):
+            # Lỗi tất định (sai mã tài liệu, sai biểu thức, sai tên công
+            # cụ) thì gọi lại bao nhiêu lần cũng thế: chỉ đốt ngân sách.
+            error = getattr(result, "error", None) or ""
+            return not any(marker in error for marker in PERMANENT_ERRORS)
+        content = getattr(result, "content", None)
+        return isinstance(content, str) and is_degraded(content)
